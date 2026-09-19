@@ -208,6 +208,44 @@ async def init_db():
 
 # ==================== HELPER FUNCTIONS ====================
 
+def parse_destination_input(text: str) -> Optional[tuple[str, str]]:
+    """
+    Parses input text to extract (numerical_id, nickname).
+    Supports:
+      - "Channel Name -1001234567890"
+      - "-1001234567890 Channel Name"
+      - "Channel_Name -1001234567890"
+    """
+    parts = text.strip().split()
+    if len(parts) < 2:
+        return None
+
+    # Check if first token is numerical ID
+    clean_first = parts[0].lstrip("-")
+    if clean_first.isdigit() and len(clean_first) >= 5:
+        numerical_id = parts[0]
+        nickname = " ".join(parts[1:]).strip()
+        return numerical_id, nickname
+
+    # Check if last token is numerical ID
+    clean_last = parts[-1].lstrip("-")
+    if clean_last.isdigit() and len(clean_last) >= 5:
+        numerical_id = parts[-1]
+        nickname = " ".join(parts[:-1]).strip()
+        return numerical_id, nickname
+
+    # Check any middle token
+    for i, p in enumerate(parts):
+        clean = p.lstrip("-")
+        if clean.isdigit() and len(clean) >= 5:
+            numerical_id = p
+            other_parts = parts[:i] + parts[i+1:]
+            nickname = " ".join(other_parts).strip()
+            return numerical_id, nickname
+
+    return None
+
+
 def get_message_content_hash(message: Message) -> str:
     if message.photo:
         return f"photo_{message.photo[-1].file_unique_id}"
@@ -616,6 +654,7 @@ upload_batches: dict[int, UploadBatchSession] = {}
 class AdminStates(StatesGroup):
     waiting_for_queue_name = State()
     waiting_for_master_log_manual = State()
+    waiting_for_destination_manual = State()
     waiting_for_fixed_delay = State()
     waiting_for_random_delay = State()
     waiting_for_join_delay = State()
@@ -795,42 +834,40 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
     )
 
 
-# ==================== COMMAND: /addest ====================
+# ==================== COMMAND: ADD DESTINATION ====================
 
-@router.message(Command("addest"))
-async def cmd_addest(message: Message, command: CommandObject):
+@router.message(Command("adddestination", "addest", "add_destination", "addchannel"))
+async def cmd_adddestination(message: Message, command: CommandObject):
     if message.from_user.id != get_admin_id():
         return
 
     args = command.args
     if not args:
         await message.answer(
-            "⚠️ <b>Invalid Command Format!</b>\n\n"
+            "⚠️ <b>Add Destination Command Format:</b>\n\n"
             "<b>Usage:</b>\n"
-            "<code>/addest GroupNickName numerical_id</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/addest VIP_Channel -1001234567890</code>",
+            "<code>/adddestination [Channel Name] [Numerical ID]</code>\n"
+            "or\n"
+            "<code>/adddestination [Numerical ID] [Channel Name]</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/adddestination VIP Channel -1001234567890</code>\n"
+            "• <code>/adddestination -1001234567890 VIP Channel</code>\n"
+            "• <code>/addest Marketing_Hub -1009876543210</code>",
             parse_mode="HTML"
         )
         return
 
-    parts = args.strip().split()
-    if len(parts) < 2:
+    parsed = parse_destination_input(args)
+    if not parsed:
         await message.answer(
-            "⚠️ <b>Missing Arguments!</b>\n\n"
-            "Please provide both a channel name and its numerical ID.\n"
-            "<b>Example:</b> <code>/addest VIP_Channel -1001234567890</code>",
+            "⚠️ <b>Missing or Invalid Arguments!</b>\n\n"
+            "Please provide both a channel name and its numerical ID (minimum 5 digits).\n"
+            "<b>Example:</b> <code>/adddestination VIP Channel -1001234567890</code>",
             parse_mode="HTML"
         )
         return
 
-    nickname = parts[0].strip()
-    numerical_id = parts[1].strip()
-
-    clean_id = numerical_id.lstrip("-")
-    if not clean_id.isdigit():
-        await message.answer("⚠️ <b>Invalid Chat ID!</b> Numerical ID must be numbers only (e.g., <code>-1001234567890</code>).", parse_mode="HTML")
-        return
+    numerical_id, nickname = parsed
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -854,7 +891,7 @@ async def cmd_addest(message: Message, command: CommandObject):
 
     await message.answer(
         f"✅ <b>Destination Registered Successfully!</b>\n\n"
-        f"• <b>Name:</b> {nickname}\n"
+        f"• <b>Name:</b> [{nickname}]\n"
         f"• <b>ID:</b> <code>{numerical_id}</code>\n"
         f"• <b>Category:</b> 🟢 <b>Matured Channel</b> (Default)\n\n"
         "Configure category or designate as Master Log below:",
@@ -903,7 +940,7 @@ async def admin_matrix_dest_perm(callback: CallbackQuery, bot: Bot):
     async with pool.acquire() as conn:
         master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
         dests = await conn.fetch(
-            "SELECT chat_id, title, is_unmatured FROM destinations WHERE (chat_id != $1 OR $1 IS NULL) ORDER BY is_unmatured ASC, title ASC",
+            "SELECT chat_id, title, is_unmatured, posts_delivered FROM destinations WHERE (chat_id != $1 OR $1 IS NULL) ORDER BY is_unmatured ASC, title ASC",
             master_dest
         )
 
@@ -916,7 +953,8 @@ async def admin_matrix_dest_perm(callback: CallbackQuery, bot: Bot):
     for d in dests:
         cat_badge = "⚪ Unmatured" if d["is_unmatured"] else "🟢 Matured"
         status_str = await check_bot_broadcast_permission(bot, d["chat_id"])
-        report.append(f"• <b>{d['title'] or d['chat_id']}</b> [{cat_badge}]: {status_str}")
+        delivered = d["posts_delivered"] or 0
+        report.append(f"• <b>[{d['title'] or d['chat_id']}] {{{delivered}}}</b> [{cat_badge}]: {status_str}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Re-check Permissions", callback_data="admin_matrix_dest_perm")],
@@ -951,6 +989,7 @@ async def admin_matrix_joining(callback: CallbackQuery):
         is_unm = d["is_unmatured"]
         accepting = d["accept_requests"]
         pending = pending_map.get(cid, 0)
+        posts_sent = d["posts_delivered"] or 0
         
         cat_tag = "⚪ Unmatured" if is_unm else "🟢 Matured"
         if is_unm:
@@ -963,7 +1002,8 @@ async def admin_matrix_joining(callback: CallbackQuery):
         m_app = await pool.fetchval("SELECT COUNT(*) FROM join_requests WHERE chat_id=$1 AND status='accepted' AND approved_at >= $2", cid, month_ago)
 
         report.append(
-            f"• <b>{title}</b> [{cat_tag}] (ID: <code>{cid}</code>)\n"
+            f"• <b>[{title}] {{{posts_sent}}}</b> [{cat_tag}] (ID: <code>{cid}</code>)\n"
+            f"  ├ Posts Delivered: <code>{posts_sent}</code>\n"
             f"  ├ Status: {status_tag}\n"
             f"  ├ Pending Requests: <code>{pending}</code>\n"
             f"  └ Approved | Day: <code>{d_app}</code> | Week: <code>{w_app}</code> | Month: <code>{m_app}</code>\n"
@@ -1218,6 +1258,8 @@ async def ad_broadcast_worker(bot: Bot, target_scope: str = "both"):
             for cid in target_chat_ids:
                 try:
                     await bot.copy_message(chat_id=cid, from_chat_id=ad["from_chat_id"], message_id=ad["message_id"])
+                    async with pool.acquire() as conn:
+                        await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
                 except Exception:
                     pass
 
@@ -1820,7 +1862,7 @@ async def admin_global_process_stats(callback: CallbackQuery):
             accepted = d["total_accepted"] or 0
             delivered = d["posts_delivered"] or 0
             report.append(
-                f"• <b>{title}</b> (<code>{cid}</code>)\n"
+                f"• <b>[{title}] {{{delivered}}}</b> (<code>{cid}</code>)\n"
                 f"  ├ Posts Delivered: <code>{delivered}</code> | Approved Joins: <code>{accepted}</code>\n"
                 f"  └ Pending Joins: <code>{pending}</code> ({d['join_delay_min']}s-{d['join_delay_max']}s delay)\n"
             )
@@ -1836,9 +1878,11 @@ async def admin_global_process_stats(callback: CallbackQuery):
             accepting = d["accept_requests"]
             pending = join_pending_map.get(cid, 0)
             accepted = d["total_accepted"] or 0
+            delivered = d["posts_delivered"] or 0
             status_badge = "🟢 Accepting Joins" if accepting else "⚪ Paused"
             report.append(
-                f"• <b>{title}</b> — {status_badge}\n"
+                f"• <b>[{title}] {{{delivered}}}</b> — {status_badge}\n"
+                f"  ├ Posts Delivered: <code>{delivered}</code>\n"
                 f"  ├ Requests: <code>{accepted}</code> approved, <code>{pending}</code> pending\n"
                 f"  └ Random Interval: <code>{d['join_delay_min']}s - {d['join_delay_max']}s</code>\n"
             )
@@ -1999,7 +2043,7 @@ async def admin_prompt_run_scope(callback: CallbackQuery):
         await callback.answer("⚠️ Queue is empty! No posts to broadcast.", show_alert=True)
         return
     if (m_count + u_count) == 0:
-        await callback.answer("⚠️ No broadcast destinations registered! Add one with /addest.", show_alert=True)
+        await callback.answer("⚠️ No broadcast destinations registered! Add one with /adddestination.", show_alert=True)
         return
 
     buttons = [
@@ -2151,8 +2195,12 @@ async def admin_view_destinations(callback: CallbackQuery):
     pool = await get_pool()
     async with pool.acquire() as conn:
         master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
-        matured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE AND (chat_id != $1 OR $1 IS NULL)", master_dest) or 0
-        unmatured_count = await conn.fetchval("SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE AND (chat_id != $1 OR $1 IS NULL)", master_dest) or 0
+        matured_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE is_unmatured = FALSE AND (chat_id != $1 OR $1 IS NULL)", master_dest
+        ) or 0
+        unmatured_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM destinations WHERE is_unmatured = TRUE AND (chat_id != $1 OR $1 IS NULL)", master_dest
+        ) or 0
 
     text = (
         "📡 <b>Available Destinations Hub</b>\n\n"
@@ -2165,11 +2213,88 @@ async def admin_view_destinations(callback: CallbackQuery):
     )
 
     buttons = [
+        [InlineKeyboardButton(text="➕ Add Destination (Command / Manual)", callback_data="admin_add_dest_prompt")],
         [InlineKeyboardButton(text=f"🟢 Matured Channels ({matured_count})", callback_data="admin_dest_list:matured")],
         [InlineKeyboardButton(text=f"⚪ Unmatured Channels ({unmatured_count})", callback_data="admin_dest_list:unmatured")],
         [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
     ]
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_add_dest_prompt")
+async def admin_add_dest_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id():
+        return
+
+    await state.set_state(AdminStates.waiting_for_destination_manual)
+    text = (
+        "➕ <b>Add Destination Channel:</b>\n\n"
+        "You can register a channel in two ways:\n\n"
+        "<b>1. Use Command directly:</b>\n"
+        "<code>/adddestination [Channel Name] [Numerical ID]</code>\n"
+        "<i>Example:</i> <code>/adddestination VIP Channel -1001234567890</code>\n\n"
+        "<b>2. Or reply here now:</b>\n"
+        "Send the <b>Channel Name</b> and <b>Numerical ID</b> in a single message.\n\n"
+        "<i>Send /cancel to discard.</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Destinations", callback_data="admin_view_destinations")]])
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=kb)
+
+
+@router.message(AdminStates.waiting_for_destination_manual, F.text)
+async def admin_add_dest_manual_save(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id():
+        return
+
+    if message.text.strip() == "/cancel":
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Destinations", callback_data="admin_view_destinations")]])
+        await message.answer("❌ Cancelled.", reply_markup=kb)
+        return
+
+    parsed = parse_destination_input(message.text.strip())
+    if not parsed:
+        await message.answer(
+            "⚠️ <b>Invalid Format!</b>\n\n"
+            "Please provide both channel name and numerical ID.\n"
+            "<b>Example:</b> <code>VIP Channel -1001234567890</code>\n\n"
+            "<i>Send /cancel to discard.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    numerical_id, nickname = parsed
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, chat_type, is_unmatured, accept_requests)
+            VALUES ($1, $2, 'channel', FALSE, TRUE)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            numerical_id, nickname
+        )
+
+    await state.clear()
+    buttons = [
+        [
+            InlineKeyboardButton(text="🟢 Set Matured", callback_data=f"dest_convert_matured:{numerical_id}"),
+            InlineKeyboardButton(text="⚪ Set Unmatured", callback_data=f"dest_convert_unmatured:{numerical_id}")
+        ],
+        [InlineKeyboardButton(text="📋 Set as Master Log (Process Only)", callback_data=f"dest_set_master:{numerical_id}")],
+        [InlineKeyboardButton(text="⚙️ Open Channel Actions", callback_data=f"dest_actions:{numerical_id}")]
+    ]
+
+    await message.answer(
+        f"✅ <b>Destination Registered Successfully!</b>\n\n"
+        f"• <b>Name:</b> [{nickname}]\n"
+        f"• <b>ID:</b> <code>{numerical_id}</code>\n"
+        f"• <b>Category:</b> 🟢 <b>Matured Channel</b> (Default)\n\n"
+        "Configure category or designate as Master Log below:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 @router.callback_query(F.data.startswith("admin_dest_list:"))
@@ -2192,8 +2317,11 @@ async def admin_dest_list_category(callback: CallbackQuery):
     text = f"📡 <b>{cat_label} ({len(destinations)} Total):</b>\n\n"
 
     if not destinations:
-        text += f"<i>No {category} broadcast destinations found. Register using /addest.</i>"
-        buttons = [[InlineKeyboardButton(text="🔙 Back to Available Destinations", callback_data="admin_view_destinations")]]
+        text += f"<i>No {category} broadcast destinations found. Register using /adddestination or menu.</i>"
+        buttons = [
+            [InlineKeyboardButton(text="➕ Add Destination", callback_data="admin_add_dest_prompt")],
+            [InlineKeyboardButton(text="🔙 Back to Available Destinations", callback_data="admin_view_destinations")]
+        ]
         await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
 
@@ -2201,6 +2329,7 @@ async def admin_dest_list_category(callback: CallbackQuery):
     for d in destinations:
         cid = d["chat_id"]
         title = d["title"] or cid
+        posts_count = d["posts_delivered"] or 0
         
         status_info = []
         if is_unm:
@@ -2209,9 +2338,11 @@ async def admin_dest_list_category(callback: CallbackQuery):
             status_info.append("Auto-Accept 🟢")
 
         meta_str = f" [{', '.join(status_info)}]" if status_info else ""
-        text += f"• <b>{title}</b> (<code>{cid}</code>){meta_str}\n"
-        buttons.append([InlineKeyboardButton(text=f"⚙️ Manage: {title}", callback_data=f"dest_actions:{cid}")])
+        text += f"• <b>[{title}] {{{posts_count}}}</b> (<code>{cid}</code>){meta_str}\n"
+        # MENTION MESSAGE SENT COUNT BESIDE CHANNELS IN MANAGE: [CHANNEL NAME] {POST SEND COUNT}
+        buttons.append([InlineKeyboardButton(text=f"⚙️ Manage: [{title}] {{{posts_count}}}", callback_data=f"dest_actions:{cid}")])
 
+    buttons.append([InlineKeyboardButton(text="➕ Add Destination", callback_data="admin_add_dest_prompt")])
     buttons.append([InlineKeyboardButton(text="🔙 Back to Available Destinations", callback_data="admin_view_destinations")])
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -2260,9 +2391,9 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
     join_flow_status = "🟢 Auto-Accepted (Running)" if not is_unmatured else ("🟢 Accepting Requests" if accept_requests else "⚪ Paused")
 
     card = (
-        f"⚙️ <b>Broadcast Channel:</b> <b>{title}</b> (<code>{chat_id}</code>)\n\n"
+        f"⚙️ <b>Broadcast Channel:</b> <b>[{title}] {{{delivered}}}</b> (<code>{chat_id}</code>)\n\n"
         f"• <b>Category:</b> <code>{cat_label}</code>\n"
-        f"• <b>Posts Delivered:</b> <code>{delivered}</code>\n"
+        f"• <b>Total Messages/Posts Sent:</b> <code>{delivered}</code>\n"
         f"• <b>Join Requests Mode:</b> <code>{join_flow_status}</code>\n"
         f"• <b>Approved Joins:</b> <code>{total_joins - pending_joins} / {total_joins}</code> (<b>{pending_joins} pending</b>)\n"
         f"• <b>Random Join Delay:</b> <code>{join_min}s - {join_max}s</code>"
@@ -2475,8 +2606,7 @@ async def admin_set_master_log_screen(callback: CallbackQuery):
     if current_master:
         buttons.append([InlineKeyboardButton(text="🗑 Disconnect Master Log", callback_data="admin_clear_master_log")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
-    )
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")])
 
     text = (
         "📋 <b>Master Log Channel Configuration</b>\n\n"
